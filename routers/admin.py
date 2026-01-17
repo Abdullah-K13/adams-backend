@@ -1,0 +1,577 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import List, Optional
+import os
+import tempfile
+from fpdf import FPDF
+from datetime import datetime, date, timedelta
+from pydantic import BaseModel
+
+from db.init import get_db
+from models.user import Customer, Admin
+from models.subscription import SubscriptionPlan, SubscriptionLog, Invoice, Payment, PaymentMethod
+from utils.deps import get_current_user
+
+# Simple in-memory cache for stats
+_stats_cache = {"count": 0, "expires": datetime.min}
+
+router = APIRouter(prefix="", tags=["admin"])
+
+class CustomerListItem(BaseModel):
+    id: int
+    name: str
+    email: str
+    phone: str
+    plan: str
+    status: str
+    amount: float
+    lastPayment: str
+    address: str
+    city: str
+    zip: str
+    referralNumber: Optional[str] = None
+
+
+class PlanDistributionItem(BaseModel):
+    name: str
+    value: int
+    color: str
+
+class GrowthItem(BaseModel):
+    date: str
+    customers: int
+    revenue: float
+
+class AnalyticsResponse(BaseModel):
+    mrr: float
+    active_subscribers: int
+    total_customers: int
+    plan_distribution: List[PlanDistributionItem]
+    revenue_distribution: List[PlanDistributionItem]
+    growth_history: List[GrowthItem]
+
+@router.get("/stats")
+def get_admin_stats(
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    from utils.square_client import get_subscriptions
+    subs_res = get_subscriptions(status="ACTIVE")
+    active_subs = subs_res.get("subscriptions", [])
+    
+    return {
+        "active_subscribers": len(active_subs)
+    }
+
+@router.get("/recent-invoices")
+def get_recent_invoices(
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    from utils.square_client import list_recent_invoices
+    res = list_recent_invoices(limit=5)
+    if not res.get("success"):
+        raise HTTPException(status_code=500, detail=res.get("error"))
+    
+    sq_invoices = res.get("invoices", [])
+    enriched = []
+    
+    # Pre-fetch customers to avoid N+1
+    customer_ids = list(set([inv.get("customer_id") for inv in sq_invoices if inv.get("customer_id")]))
+    customers_map = {c.square_customer_id: f"{c.first_name} {c.last_name}" for c in db.query(Customer).filter(Customer.square_customer_id.in_(customer_ids)).all()}
+
+    for inv in sq_invoices:
+        i = inv.copy()
+        sq_cid = i.get("customer_id")
+        i["customer_name"] = customers_map.get(sq_cid, "Unknown Customer")
+        
+        # Calculate amount
+        amount = 0
+        if i.get("payment_requests"):
+            amount = int(i["payment_requests"][0].get("computed_amount_money", {}).get("amount", 0)) / 100.0
+        elif i.get("next_payment_amount_money"):
+             amount = int(i["next_payment_amount_money"].get("amount", 0)) / 100.0
+        
+        i["amount"] = amount
+        i["description"] = i.get("title") or i.get("description") or "Subscription Payment"
+        enriched.append(i)
+        
+    return {"success": True, "invoices": enriched}
+
+@router.get("/analytics", response_model=AnalyticsResponse)
+def get_admin_analytics(
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    from utils.square_client import get_subscriptions, get_subscription_plans
+    
+    subs_res = get_subscriptions(status="ACTIVE")
+    active_subs = subs_res.get("subscriptions", [])
+    active_sub_count = len(active_subs)
+    
+    plans_res = get_subscription_plans()
+    plans = plans_res.get("plans", [])
+    
+    variation_map = {}
+    for p in plans:
+        p_name = p.get("name", "Unknown Plan")
+        for v in p.get("variations", []):
+            var_id = v.get("id")
+            phases = v.get("phases", [])
+            price = 0.0
+            if phases:
+                amount_money = phases[0].get("recurring_price_money", {})
+                price = float(amount_money.get("amount", 0)) / 100.0
+            
+            variation_map[var_id] = {"name": p_name, "price": price}
+
+    mrr = 0.0
+    plan_counts = {}
+    plan_revenue = {}
+    
+    for sub in active_subs:
+        var_id = sub.get("plan_variation_id")
+        if var_id and var_id in variation_map:
+            details = variation_map[var_id]
+            price = details["price"]
+            p_name = details["name"]
+            
+            mrr += price
+            plan_counts[p_name] = plan_counts.get(p_name, 0) + 1
+            plan_revenue[p_name] = plan_revenue.get(p_name, 0) + price
+        else:
+            p_name = "Unknown Plan"
+            plan_counts[p_name] = plan_counts.get(p_name, 0) + 1
+            plan_revenue[p_name] = plan_revenue.get(p_name, 0) + 0.0
+
+    colors = ["#21568F", "#2D6A4F", "#f59e0b", "#ef4444", "#8b5cf6"]
+    plan_dist = []
+    rev_dist = []
+    
+    for i, name in enumerate(plan_counts.keys()):
+        color = colors[i % len(colors)]
+        
+        plan_dist.append(PlanDistributionItem(
+            name=name,
+            value=plan_counts[name],
+            color=color
+        ))
+        
+        rev_dist.append(PlanDistributionItem(
+            name=name,
+            value=int(plan_revenue.get(name, 0)),
+            color=color
+        ))
+        
+    total_customers = db.query(Customer).count()
+    
+    thirty_days_ago = datetime.now() - timedelta(days=30)
+    
+    daily_growth = db.query(
+        func.date(Customer.created_at).label('date'),
+        func.count(Customer.id)
+    ).filter(Customer.created_at >= thirty_days_ago)\
+     .group_by(func.date(Customer.created_at))\
+     .order_by(func.date(Customer.created_at))\
+     .all()
+     
+    growth_map = {str(d): c for d, c in daily_growth}
+
+    # Fetch daily revenue from Invoices table
+    daily_revenue = db.query(
+        func.date(Invoice.created_at).label('date'),
+        func.sum(Invoice.amount).label('total')
+    ).filter(Invoice.created_at >= thirty_days_ago, Invoice.status == 'PAID')\
+     .group_by(func.date(Invoice.created_at))\
+     .all()
+    
+    revenue_map = {str(d): float(t) for d, t in daily_revenue}
+    
+    growth_history = []
+    count_before = db.query(Customer).filter(Customer.created_at < thirty_days_ago).count()
+    current_total = count_before
+    
+    for i in range(31):
+        d = thirty_days_ago + timedelta(days=i)
+        d_str = d.strftime("%Y-%m-%d")
+        daily_new = growth_map.get(d_str, 0)
+        daily_rev = revenue_map.get(d_str, 0.0)
+        current_total += daily_new
+        growth_history.append(GrowthItem(date=d_str, customers=current_total, revenue=daily_rev))
+
+    return AnalyticsResponse(
+        mrr=mrr,
+        active_subscribers=active_sub_count,
+        total_customers=total_customers,
+        plan_distribution=plan_dist,
+        revenue_distribution=rev_dist,
+        growth_history=growth_history
+    )
+
+@router.get("/customers", response_model=List[CustomerListItem])
+def list_customers(
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can access this resource"
+        )
+    
+    customers = db.query(Customer).all()
+    all_plans = {p.id: p for p in db.query(SubscriptionPlan).all()}
+    
+    last_payments = db.query(
+        Payment.customer_id,
+        func.max(Payment.created_at)
+    ).group_by(Payment.customer_id).all()
+    last_payment_map = {cid: dt for cid, dt in last_payments}
+
+    result = []
+    for c in customers:
+        plan_name = "No Plan"
+        plan_cost = 0.0
+        
+        try:
+            pid = int(c.plan_id) if c.plan_id else None
+            if pid and pid in all_plans:
+                plan_name = all_plans[pid].plan_name
+                plan_cost = all_plans[pid].plan_cost
+        except (ValueError, TypeError):
+            pass
+
+        last_payment_date = last_payment_map.get(c.id)
+        last_payment_str = last_payment_date.strftime("%Y-%m-%d") if last_payment_date else "N/A"
+
+        result.append(CustomerListItem(
+            id=c.id,
+            name=f"{c.first_name} {c.last_name}",
+            email=c.email,
+            phone=c.phone_number or "",
+            plan=plan_name,
+            status="Active" if c.subscription_active else "Inactive",
+            amount=plan_cost,
+            lastPayment=last_payment_str,
+            address=c.address or "",
+            city=c.city or "",
+            zip=c.zip_code or "",
+            referralNumber=c.referral_number or ""
+        ))
+    
+    return result
+
+@router.post("/cancel-subscription/{customer_id}")
+def cancel_customer_subscription(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_subscription_id:
+        raise HTTPException(status_code=404, detail="Active subscription not found")
+    
+    from utils.square_client import cancel_subscription
+    res = cancel_subscription(customer.square_subscription_id)
+    
+    if not res.get("subscription"):
+        raise HTTPException(status_code=400, detail="Square error or failed to cancel")
+    
+    customer.subscription_active = False
+    customer.subscription_status = "CANCELED"
+    
+    # Log action
+    log = SubscriptionLog(
+        customer_id=customer.id,
+        subscription_id=customer.square_subscription_id,
+        action="CANCEL",
+        effective_date=date.today()
+    )
+    db.add(log)
+    db.commit()
+    
+    return {"success": True, "message": "Subscription canceled"}
+
+@router.get("/customer-cards/{customer_id}")
+def get_customer_cards(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_customer_id:
+        raise HTTPException(status_code=404, detail="Square customer not found")
+    
+    from utils.square_client import get_customer_cards
+    res = get_customer_cards(customer.square_customer_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+    
+    return res
+
+@router.post("/remove-card/{customer_id}/{card_id}")
+def remove_customer_card(
+    customer_id: int,
+    card_id: str,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    from utils.square_client import disable_card
+    res = disable_card(card_id)
+    
+    if "errors" in res:
+        raise HTTPException(status_code=400, detail="Square error")
+    
+    return {"success": True, "message": "Card removed"}
+
+class SaveCardRequest(BaseModel):
+    source_id: str
+
+@router.post("/save-card/{customer_id}")
+def admin_save_customer_card(
+    customer_id: int,
+    request: SaveCardRequest,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_customer_id:
+        raise HTTPException(status_code=404, detail="Square customer not found")
+    
+    from utils.square_client import create_card_on_file
+    res = create_card_on_file(request.source_id, customer.square_customer_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+    
+    return {"success": True, "message": "Card saved successfully", "card": res.get("card")}
+
+class UpdateCustomerRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: str
+    phone_number: str
+    address: str
+    city: str
+    zip_code: str
+
+@router.put("/customer-details/{customer_id}")
+def update_customer_details(
+    customer_id: int,
+    request: UpdateCustomerRequest,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    if customer.square_customer_id:
+        from utils.square_client import update_square_customer
+        sq_res = update_square_customer(
+            customer.square_customer_id,
+            given_name=request.first_name,
+            family_name=request.last_name,
+            email_address=request.email,
+            phone_number=request.phone_number,
+            address={
+                "address_line_1": request.address,
+                "locality": request.city,
+                "postal_code": request.zip_code
+            }
+        )
+        if not sq_res.get("success"):
+            raise HTTPException(status_code=400, detail=f"Square sync error: {sq_res.get('error')}")
+
+    customer.first_name = request.first_name
+    customer.last_name = request.last_name
+    customer.email = request.email
+    customer.phone_number = request.phone_number
+    customer.address = request.address
+    customer.city = request.city
+    customer.zip_code = request.zip_code
+    
+    db.commit()
+    return {"success": True, "message": "Customer details updated"}
+
+@router.get("/customer-payments/{customer_id}")
+def get_customer_payments(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_customer_id:
+        raise HTTPException(status_code=404, detail="Square customer not found")
+    
+    from utils.square_client import get_customer_invoices
+    res = get_customer_invoices(customer.square_customer_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+    
+    return res
+
+class ChangeSubscriptionRequest(BaseModel):
+    new_plan_variation_id: str
+
+@router.post("/change-subscription/{customer_id}")
+def admin_change_subscription(
+    customer_id: int,
+    request: ChangeSubscriptionRequest,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+        
+    if not customer.square_subscription_id:
+        raise HTTPException(status_code=400, detail="Customer has no active subscription")
+    
+    from utils.square_client import update_subscription
+    res = update_subscription(customer.square_subscription_id, request.new_plan_variation_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+        
+    plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.new_plan_variation_id).first()
+    if plan:
+        customer.plan_id = str(plan.id)
+        customer.plan_variation_id = request.new_plan_variation_id
+        
+        # Log action
+        log = SubscriptionLog(
+            customer_id=customer.id,
+            subscription_id=customer.square_subscription_id,
+            action="ACTIVATE", # Or "CHANGE" if we had that, but "ACTIVATE" implies new plan session
+            effective_date=date.today()
+        )
+        db.add(log)
+        db.commit()
+    
+    return {"success": True, "message": "Subscription updated successfully"}
+
+@router.post("/sync-invoices/{customer_id}")
+def sync_customer_invoices(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_customer_id:
+        raise HTTPException(status_code=404, detail="Customer not found or no Square ID")
+    
+    from utils.square_client import get_customer_invoices
+    res = get_customer_invoices(customer.square_customer_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+    
+    sq_invoices = res.get("invoices", [])
+    synced_count = 0
+    
+    for sq_inv in sq_invoices:
+        inv_id = sq_inv.get("id")
+        
+        amount_data = {}
+        if sq_inv.get("payment_requests"):
+            amount_data = sq_inv.get("payment_requests")[0].get("computed_amount_money", {})
+        if not amount_data.get("amount") and sq_inv.get("next_payment_amount_money"):
+             amount_data = sq_inv.get("next_payment_amount_money")
+             
+        amount = float(amount_data.get("amount", 0)) / 100.0
+        
+        existing = db.query(Invoice).filter(Invoice.square_invoice_id == inv_id).first()
+        
+        due_date_str = sq_inv.get("scheduled_at") or sq_inv.get("created_at", datetime.now().isoformat())
+        try:
+            if "T" in due_date_str:
+                due_date = datetime.fromisoformat(due_date_str.replace("Z", "+00:00")).date()
+            else:
+                due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        except:
+            due_date = datetime.now().date()
+
+        if not existing:
+            new_inv = Invoice(
+                square_invoice_id=inv_id,
+                customer_id=customer.id,
+                subscription_id=sq_inv.get("subscription_id"),
+                amount=amount,
+                status=sq_inv.get("status"),
+                due_date=due_date,
+                public_url=sq_inv.get("public_url")
+            )
+            db.add(new_inv)
+            synced_count += 1
+        else:
+            existing.status = sq_inv.get("status")
+            existing.public_url = sq_inv.get("public_url")
+            existing.amount = amount
+    
+    db.commit()
+    return {"success": True, "synced": synced_count}
+
+@router.get("/invoice-pdf/{square_invoice_id}")
+def download_invoice_pdf(
+    square_invoice_id: str,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+        
+    invoice = db.query(Invoice).filter(Invoice.square_invoice_id == square_invoice_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found. Please sync first.")
+        
+    customer = db.query(Customer).get(invoice.customer_id)
+    
+    plan_name = "Subscription Service"
+    if customer.plan_id:
+        try:
+            plan = db.query(SubscriptionPlan).get(int(customer.plan_id))
+            if plan:
+                plan_name = plan.plan_name
+        except:
+            pass
+            
+    from utils.pdf_generator import generate_invoice_pdf
+    return generate_invoice_pdf(invoice, customer, plan_name)
